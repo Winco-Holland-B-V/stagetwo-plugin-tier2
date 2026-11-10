@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { alleBestanden, git, insteadOfEnv, maakKlantRepo, maakTemplateRepo, nepGh, nepPnpm_opPad, opruimen, tijdelijkeMap } from "../../../lib/test-hulp.mjs";
-import { BEVESTIGING, WERKMAP_PREFIX, controleerWerkmap, hoofd, leesArgumenten, zonderLogin } from "./bijwerken.mjs";
+import { BEVESTIGING, WERKMAP_PREFIX, biomeVersie, controleerWerkmap, formatteer, hoofd, leesArgumenten, zonderLogin } from "./bijwerken.mjs";
 
 const SCRIPT = fileURLToPath(import.meta.url).replace(/\.test\.mjs$/, ".mjs");
 
@@ -53,7 +53,11 @@ function wereld({ gh = GH_STANDAARD, tagV9 = true, app } = {}) {
 }
 
 test("argumenten en het afplakken van een login in een URL", () => {
-  assert.deepEqual(leesArgumenten(["--json", "--droogloop"]), { json: true, droogloop: true, werkmap: null, losOp: [], checkout: null, repo: null });
+  assert.deepEqual(leesArgumenten(["--json", "--droogloop"]), { json: true, droogloop: true, werkmap: null, losOp: [], koppen: {}, checkout: null, repo: null });
+  assert.deepEqual(leesArgumenten(["--werkmap", "/t/x", "--kop", "/", "Mijn lijst", "--kop", "/klanten", "Alle klanten"]).koppen, {
+    "/": "Mijn lijst",
+    "/klanten": "Alle klanten",
+  });
   assert.equal(leesArgumenten(["--droogloop", "--repo", "klant/voorraad"]).repo, "klant/voorraad");
   assert.deepEqual(leesArgumenten(["--werkmap", "/t/x", "--los-op", "a.yml", "template", "--los-op", "b.yml", "eigen"]).losOp, [
     { pad: "a.yml", keuze: "template" },
@@ -141,6 +145,19 @@ test("voorcontrole: gh niet ingelogd, geen netwerk, geen manifest, geen schrijfr
     v.opruimen();
   }
 
+  const l = wereld();
+  try {
+    // Een app van tier 1: variant "light". Die werk je bij met de plugin van tier 1.
+    const pad = join(l.klant.checkout, ".claude", "stack-manifest.json");
+    writeFileSync(pad, JSON.stringify({ ...JSON.parse(readFileSync(pad, "utf8")), variant: "light" }));
+    const r = l.draai(["--droogloop"]);
+    assert.equal(r.status, "ander-spoor");
+    assert.match(r.reden, /\/stagetwo-tier1:updaten/);
+    assert.deepEqual(l.werkmappen(), []);
+  } finally {
+    l.opruimen();
+  }
+
   const s = wereld();
   try {
     git(s.klant.checkout, "remote", "set-url", "--push", "origin", join(s.wortel, "alleen-lezen.git"));
@@ -150,20 +167,6 @@ test("voorcontrole: gh niet ingelogd, geen netwerk, geen manifest, geen schrijfr
     assert.deepEqual(s.werkmappen(), [], "na een mislukte voorcontrole is er geen tijdelijke map meer");
   } finally {
     s.opruimen();
-  }
-});
-
-test("open PR van de beheerde run voor dezelfde versie: gestopt met de URL, niets gekloond", () => {
-  const w = wereld({
-    gh: { ...GH_STANDAARD, "pr list": { stdout: [{ number: 7, headRefName: "stack-sync/v9", url: "https://github.com/klant/app/pull/7" }] } },
-  });
-  try {
-    const r = w.draai(["--droogloop"]);
-    assert.equal(r.status, "gestopt");
-    assert.match(r.reden, /pull\/7/);
-    assert.deepEqual(w.werkmappen(), []);
-  } finally {
-    w.opruimen();
   }
 });
 
@@ -228,6 +231,186 @@ test("echte run: branch op origin met de identiteit van de klant, main onaangero
     assert.ok(!body.includes("Stage Two stack-sync"));
     // Geen commit als Stage Two in de klantrepo vanuit de skill.
     assert.ok(!git(w.klant.origin, "log", "--format=%an", "stack-bijwerken/v9").includes("Stage Two"));
+  } finally {
+    w.opruimen();
+  }
+});
+
+/** Zoals de droogloop het zou vinden: één tabel zonder A/B-test (in toestand.json van de werkmap). */
+function metAbTest(werkmap, tabel = "klanten") {
+  const pad = join(werkmap, "toestand.json");
+  const t = JSON.parse(readFileSync(pad, "utf8"));
+  t.resultaat.abTests = { tabellen: [tabel], paden: { [tabel]: `tests/rls/afscherming/${tabel}.test.ts` }, hulp: "tests/rls/lib/afscherming.ts" };
+  writeFileSync(pad, JSON.stringify(t));
+  const test = join(werkmap, "app", "tests", "rls", "afscherming", `${tabel}.test.ts`);
+  mkdirSync(join(test, ".."), { recursive: true });
+  writeFileSync(test, `await controleerAfscherming({ tabel: "${tabel}" });\n`);
+}
+
+const RULESET_ZONDER = {
+  id: 1,
+  name: "main beschermen",
+  target: "branch",
+  enforcement: "active",
+  conditions: { ref_name: { include: ["~DEFAULT_BRANCH"], exclude: [] } },
+  rules: [{ type: "required_status_checks", parameters: { strict_required_status_checks_policy: true, required_status_checks: [{ context: "Code" }] } }],
+};
+
+test("A/B-tests en ruleset: de test van Claude komt mee onder een eigen kopje, en main eist de droogloop", () => {
+  const w = wereld({
+    gh: {
+      ...GH_STANDAARD,
+      "api repos/klant/app/rulesets?includes_parents=false": { stdout: [{ id: 1, name: "main beschermen" }] },
+      "api repos/klant/app/rulesets/1": { stdout: RULESET_ZONDER },
+    },
+  });
+  try {
+    const d = w.draai(["--droogloop"]);
+    assert.equal(d.status, "klaar", d.reden);
+    metAbTest(d.werkmap);
+    const r = w.draai(["--json", "--werkmap", d.werkmap]);
+    assert.equal(r.status, "gepusht", r.reden);
+    assert.deepEqual(r.abTests.geschreven, [{ tabel: "klanten", pad: "tests/rls/afscherming/klanten.test.ts" }]);
+    assert.match(git(w.klant.origin, "show", "stack-bijwerken/v9:tests/rls/afscherming/klanten.test.ts"), /tabel: "klanten"/);
+    const create = w.nep.aanroepen().find((a) => a[0] === "pr" && a[1] === "create");
+    const body = create[create.indexOf("--body") + 1];
+    assert.match(body, /\*\*A\/B-tests voor tabellen die er nog geen hadden\*\*/);
+    assert.match(body, /- `klanten`: `tests\/rls\/afscherming\/klanten\.test\.ts`/);
+    assert.ok(body.endsWith(BEVESTIGING));
+    assert.equal(r.ruleset.status, "bijgezet");
+    const put = w.nep.aanroepen().find((a) => a[0] === "api" && a.includes("PUT"));
+    assert.equal(put[1], "repos/klant/app/rulesets/1");
+    assert.ok(!body.includes("beheerrechten"), "met rechten geen regel onder Voor jou");
+  } finally {
+    w.opruimen();
+  }
+});
+
+test("testrol: de aanpassing van Claude in global-setup zit in de commit van updaten, dus een volgende updaten stopt niet", () => {
+  const w = wereld();
+  try {
+    const d = w.draai(["--droogloop"]);
+    const pad = join(d.werkmap, "toestand.json");
+    const t = JSON.parse(readFileSync(pad, "utf8"));
+    const voor = "export default async function globalSetup() {}\n";
+    t.resultaat.testrol = { pad: "e2e/global-setup.ts", voor };
+    writeFileSync(pad, JSON.stringify(t));
+    mkdirSync(join(d.werkmap, "app", "e2e"), { recursive: true });
+    writeFileSync(join(d.werkmap, "app", "e2e", "global-setup.ts"), 'export default async function globalSetup() {\n  geefTestrol();\n}\nfunction geefTestrol() { const b = "supabase/testrol.sql"; }\n');
+    const r = w.draai(["--json", "--werkmap", d.werkmap]);
+    assert.equal(r.status, "gepusht", r.reden);
+    assert.deepEqual(r.testrol, { pad: "e2e/global-setup.ts", gedaan: true });
+    assert.match(git(w.klant.origin, "show", "stack-bijwerken/v9:e2e/global-setup.ts"), /geefTestrol\(\)/);
+    const create = w.nep.aanroepen().find((a) => a[0] === "pr" && a[1] === "create");
+    const body = create[create.indexOf("--body") + 1];
+    assert.match(body, /\*\*De testrol in de browsertest\*\*/);
+    const opnieuw = w.draai(["--droogloop"]);
+    assert.equal(opnieuw.status, "klaar", opnieuw.reden);
+  } finally {
+    w.opruimen();
+  }
+});
+
+test("open voor iedereen: het voorstel van Claude (een nieuwe migratie) zit in de commit van updaten en staat in de PR", () => {
+  const w = wereld();
+  try {
+    const d = w.draai(["--droogloop"]);
+    const pad = join(d.werkmap, "toestand.json");
+    const t = JSON.parse(readFileSync(pad, "utf8"));
+    const migratie = "supabase/migrations/20261106120000_open_regels_smaller.sql";
+    t.resultaat.openTabellen = { tabellen: [], nooit: ['prijzen (policy "iedereen", anon, for select)'], config: "{}", migratie };
+    writeFileSync(pad, JSON.stringify(t));
+    mkdirSync(join(d.werkmap, "app", "supabase", "migrations"), { recursive: true });
+    writeFileSync(join(d.werkmap, "app", migratie), '-- uitleg: alleen wie is ingelogd ziet de prijzen\ndrop policy "iedereen" on public.prijzen;\n');
+    const r = w.draai(["--json", "--werkmap", d.werkmap]);
+    assert.equal(r.status, "gepusht", r.reden);
+    assert.equal(r.smal.gedaan, true);
+    assert.match(git(w.klant.origin, "show", `stack-bijwerken/v9:${migratie}`), /drop policy/);
+    const create = w.nep.aanroepen().find((a) => a[0] === "pr" && a[1] === "create");
+    const body = create[create.indexOf("--body") + 1];
+    assert.match(body, /\*\*Regels die open stonden voor iedereen op internet\*\*/);
+    assert.match(body, /- alleen wie is ingelogd ziet de prijzen/);
+    assert.doesNotMatch(body, /Nog niet mergen/);
+  } finally {
+    w.opruimen();
+  }
+});
+
+test("A/B-tests: zegt de bouwer dat iedereen de tabel mag zien, dan komt zijn antwoord in open_tabellen", () => {
+  const w = wereld();
+  try {
+    const d = w.draai(["--droogloop"]);
+    assert.equal(d.status, "klaar", d.reden);
+    const toestand = join(d.werkmap, "toestand.json");
+    const t = JSON.parse(readFileSync(toestand, "utf8"));
+    const config = join(d.werkmap, "app", "stack.config.json");
+    const voor = existsSync(config) ? readFileSync(config, "utf8") : null;
+    t.resultaat.abTests = { tabellen: ["orders"], paden: { orders: "tests/rls/afscherming/orders.test.ts" }, hulp: "tests/rls/lib/afscherming.ts", config: voor };
+    writeFileSync(toestand, JSON.stringify(t));
+    const c = voor ? JSON.parse(voor) : {};
+    c.open_tabellen = { ...(c.open_tabellen ?? {}), orders: "iedereen in het bedrijf mag alle orders zien (Piet, 06-11-2026)" };
+    writeFileSync(config, `${JSON.stringify(c, null, 2)}\n`);
+    const r = w.draai(["--json", "--werkmap", d.werkmap]);
+    assert.equal(r.status, "gepusht", r.reden);
+    assert.deepEqual(r.abTests.open, [{ tabel: "orders", reden: "iedereen in het bedrijf mag alle orders zien (Piet, 06-11-2026)" }]);
+    assert.deepEqual(r.abTests.geschreven, []);
+    assert.match(git(w.klant.origin, "show", "stack-bijwerken/v9:stack.config.json"), /"orders": "iedereen in het bedrijf/);
+    const create = w.nep.aanroepen().find((a) => a[0] === "pr" && a[1] === "create");
+    const body = create[create.indexOf("--body") + 1];
+    assert.match(body, /\*\*Tabellen die iedereen in de app mag zien\*\*/);
+    assert.doesNotMatch(body, /door updaten geschreven/);
+  } finally {
+    w.opruimen();
+  }
+});
+
+test("A/B-tests: een andere wijziging in stack.config.json stopt de run", () => {
+  const w = wereld();
+  try {
+    const d = w.draai(["--droogloop"]);
+    const toestand = join(d.werkmap, "toestand.json");
+    const t = JSON.parse(readFileSync(toestand, "utf8"));
+    t.resultaat.abTests = { tabellen: ["orders"], paden: { orders: "tests/rls/afscherming/orders.test.ts" }, hulp: "tests/rls/lib/afscherming.ts", config: null };
+    writeFileSync(toestand, JSON.stringify(t));
+    writeFileSync(join(d.werkmap, "app", "stack.config.json"), JSON.stringify({ open_tabellen: { klanten: "zomaar" } }));
+    const r = w.draai(["--json", "--werkmap", d.werkmap]);
+    assert.equal(r.status, "gestopt");
+    assert.match(r.reden, /open_tabellen/);
+  } finally {
+    w.opruimen();
+  }
+});
+
+test("A/B-tests: alleen de voorspelde paden; een ander nieuw bestand stopt de run", () => {
+  const w = wereld();
+  try {
+    const d = w.draai(["--droogloop"]);
+    metAbTest(d.werkmap);
+    writeFileSync(join(d.werkmap, "app", "src", "ook.ts"), "export const x = 1;\n");
+    const r = w.draai(["--json", "--werkmap", d.werkmap]);
+    assert.equal(r.status, "gestopt");
+    assert.deepEqual(r.buitenManifest, ["src/ook.ts"]);
+  } finally {
+    w.opruimen();
+  }
+});
+
+test("ruleset zonder beheerrechten: één regel onder Voor jou, en de pull request komt er gewoon", () => {
+  const w = wereld({
+    gh: {
+      ...GH_STANDAARD,
+      "api repos/klant/app/rulesets?includes_parents=false": { stdout: [] },
+      "api repos/klant/app/rulesets": { exit: 1, stderr: "gh: Must have admin rights to Repository. (HTTP 403)" },
+    },
+  });
+  try {
+    const d = w.draai(["--droogloop"]);
+    const r = w.draai(["--json", "--werkmap", d.werkmap]);
+    assert.equal(r.status, "gepusht", r.reden);
+    assert.equal(r.ruleset.status, "geen-rechten");
+    const create = w.nep.aanroepen().find((a) => a[0] === "pr" && a[1] === "create");
+    const body = create[create.indexOf("--body") + 1];
+    assert.match(body, /\*\*Voor jou:\*\*\n(- .*\n)*- De controle "Droogloop migraties" staat nog niet verplicht op main van klant\/app/);
   } finally {
     w.opruimen();
   }
@@ -516,5 +699,60 @@ test("het script als opdracht: --json geeft één JSON-object en de exitcode vol
     w.draai(["--werkmap", r.werkmap]);
   } finally {
     w.opruimen();
+  }
+});
+
+test("--repo: een andere app van een ander spoor wordt na het klonen geweigerd, zonder werkmap", () => {
+  for (const [variant, plugin] of [["light", /\/stagetwo-tier1:updaten/], [undefined, /oudere template/]]) {
+    const w = wereld();
+    try {
+      git(w.klant.checkout, "checkout", "-q", "main");
+      const pad = join(w.klant.checkout, ".claude", "stack-manifest.json");
+      const { variant: _weg, ...rest } = JSON.parse(readFileSync(pad, "utf8"));
+      writeFileSync(pad, JSON.stringify(variant ? { ...rest, variant } : rest));
+      git(w.klant.checkout, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "ander spoor");
+      git(w.klant.checkout, "push", "-q", w.klant.origin, "main");
+      const leeg = tijdelijkeMap("lege-map-");
+      const r = w.draai(["--droogloop", "--repo", "klant/app", "--checkout", leeg]);
+      assert.equal(r.status, "ander-spoor", r.reden);
+      assert.match(r.reden, plugin);
+      assert.deepEqual(w.werkmappen(), [], "de kloon is opgeruimd");
+      opruimen(leeg);
+    } finally {
+      w.opruimen();
+    }
+  }
+});
+
+test("biomeVersie: de versie uit package.json, zonder ^ of ~", () => {
+  const map = tijdelijkeMap("biome-versie-");
+  try {
+    writeFileSync(join(map, "package.json"), JSON.stringify({ devDependencies: { "@biomejs/biome": "^2.6.2" } }));
+    assert.equal(biomeVersie(map), "2.6.2");
+    writeFileSync(join(map, "package.json"), JSON.stringify({ devDependencies: { "@biomejs/biome": "latest" } }));
+    assert.equal(biomeVersie(map), null);
+    writeFileSync(join(map, "package.json"), JSON.stringify({}));
+    assert.equal(biomeVersie(map), null);
+  } finally {
+    opruimen(map);
+  }
+});
+
+test("formatteer: zonder Biome op deze computer (--repo) via pnpm dlx in de versie van de app", () => {
+  const kloon = tijdelijkeMap("formatteer-kloon-");
+  const bin = tijdelijkeMap("formatteer-bin-");
+  const pathVoor = process.env.PATH;
+  try {
+    writeFileSync(join(kloon, "package.json"), JSON.stringify({ devDependencies: { "@biomejs/biome": "2.6.2" } }));
+    const log = join(bin, "aanroep.json");
+    writeFileSync(join(bin, "pnpm"), `#!/usr/bin/env node\nrequire("node:fs").writeFileSync(${JSON.stringify(log)}, JSON.stringify(process.argv.slice(2)));\n`);
+    execFileSync("chmod", ["+x", join(bin, "pnpm")]);
+    process.env.PATH = `${bin}:${pathVoor}`;
+    formatteer({ kloon, checkout: null, paden: ["tests/rls/afscherming/deals.test.ts"] });
+    assert.deepEqual(JSON.parse(readFileSync(log, "utf8")), ["dlx", "@biomejs/biome@2.6.2", "check", "--write", "tests/rls/afscherming/deals.test.ts"]);
+  } finally {
+    process.env.PATH = pathVoor;
+    opruimen(kloon);
+    opruimen(bin);
   }
 });

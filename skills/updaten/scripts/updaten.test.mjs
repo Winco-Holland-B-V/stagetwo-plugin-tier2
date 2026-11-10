@@ -76,7 +76,7 @@ test("overzicht: alleen Cloudflare-template-apps met schrijfrecht (geen Vercel-a
     "api repos/klant/nieuw/contents/.claude/stack-manifest.json": { stdout: CLOUDFLARE_MANIFEST },
     "api repos/klant/vercel-app/contents/.claude/stack-manifest.json": { stdout: { stackVersion: 6 } },
     "api repos/klant/vercel-app/contents/.claude/stack-version": raw(6),
-    "pr list": { stdout: [{ number: 3, headRefName: "stack-sync/v9", url: "https://github.com/klant/portaal/pull/3" }] },
+    "pr list": { stdout: [{ number: 3, headRefName: "stack-bijwerken/v9", url: "https://github.com/klant/portaal/pull/3" }] },
   });
   try {
     const r = w.draai(["--json", "--eigenaar", "klant"]);
@@ -204,6 +204,37 @@ test("afhankelijkheden: lockfile veranderd geeft een eigen PR met de naam van de
   }
 });
 
+test("afhankelijkheden: staat de template-PR open, dan bouwt deze PR daarop voort (niet op main)", () => {
+  const w = afhWereld({
+    gh: { "pr list": { stdout: [{ number: 3, headRefName: "stack-bijwerken/v9", url: "https://github.com/klant/app/pull/3" }] } },
+  });
+  try {
+    // De template-PR: een eigen commit op stack-bijwerken/v9 (zoals bijwerken.mjs hem pusht).
+    const kopie = join(w.klant.checkout, "..", "template-pr");
+    git(w.klant.origin, "branch", "stack-bijwerken/v9", "main");
+    execFileSync("git", ["clone", "-q", "-b", "stack-bijwerken/v9", w.klant.origin, kopie]);
+    writeFileSync(join(kopie, "biome.json"), "{ \"nieuw\": true }\n");
+    git(kopie, "add", "biome.json");
+    git(kopie, "-c", "user.name=Bart Klant", "-c", "user.email=bart@example.com", "commit", "-q", "-m", "chore: template naar versie 9");
+    git(kopie, "push", "-q", "origin", "stack-bijwerken/v9");
+
+    const r = w.draai(["--json"]);
+    assert.equal(r.status, "gepusht", r.reden);
+    assert.equal(r.opTemplate, "https://github.com/klant/app/pull/3");
+    assert.deepEqual(git(w.klant.origin, "diff", "--name-only", `stack-bijwerken/v9..${BRANCH}`).split("\n"), ["pnpm-lock.yaml"]);
+    assert.equal(git(w.klant.origin, "merge-base", "--is-ancestor", "stack-bijwerken/v9", BRANCH), "");
+    const create = w.nep.aanroepen().find((a) => a[0] === "pr" && a[1] === "create");
+    const body = create[create.indexOf("--body") + 1];
+    assert.match(body, /Merge eerst de pull request van de template\*\* \(https:\/\/github\.com\/klant\/app\/pull\/3\)/);
+    // Tot de template-PR gemerged is, raakt deze PR templatebestanden: zonder deze regels is
+    // guard:template rood (gevonden bij de test van uitgave 40, business#127 en stagetwo-site#64).
+    assert.match(body, /^Bevestigd: templatebestanden gewijzigd$/m);
+    assert.match(body, /^Geen tests nodig: \S/m);
+  } finally {
+    w.opruimen();
+  }
+});
+
 test("afhankelijkheden: niets veranderd is bij, en een open voorstel stopt zonder te klonen", () => {
   const w = afhWereld({ pnpm: { verandert: false } });
   try {
@@ -256,4 +287,10 @@ test("afhankelijkheden: een importer buiten de repo in het lockfile stopt hem, e
   } finally {
     w.opruimen();
   }
+});
+
+test("afhankelijkheden: zonder template-PR geen ontsnappingsregels in de PR-tekst", () => {
+  const tekst = prTekst({ hoofdversies: [], dependabot: [] });
+  assert.doesNotMatch(tekst, /Bevestigd:/);
+  assert.doesNotMatch(tekst, /Geen tests nodig:/);
 });

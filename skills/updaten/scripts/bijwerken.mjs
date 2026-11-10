@@ -9,9 +9,13 @@
  *       doelversie), branch stack-bijwerken/v<n>, de kern toepassen; niets gepusht.
  *       Het resultaat bevat `werkmap` voor de tweede aanroep.
  *
- *   node bijwerken.mjs --json --werkmap <map> [--los-op <pad> template|eigen]...
- *       keuzes voor overgeslagen bestanden toepassen, committen met de identiteit uit de
- *       checkout, pushen als de boom verschilt, de pull request openen of bijwerken.
+ *   node bijwerken.mjs --json --werkmap <map> [--los-op <pad> template|eigen]... [--kop <pad> <kop>]...
+ *       keuzes voor overgeslagen bestanden toepassen, de koppen van de onderdelen invullen
+ *       (alleen als de droogloop src/onderdelen.ts heeft neergezet), de A/B-tests die Claude
+ *       tussen de twee aanroepen schreef toelaten (alleen de paden uit `abTests` van de
+ *       droogloop; lib/abtests.mjs), committen met de identiteit uit de checkout, pushen als
+ *       de boom verschilt, de verplichte controle "Droogloop migraties" in de ruleset zetten
+ *       (lib/controles.mjs), de pull request openen of bijwerken.
  *
  * Met --repo werkt het script een andere app van de klant bij, zonder dat die op deze
  * computer staat: dezelfde route, alleen komt de kloon dan rechtstreeks van GitHub
@@ -27,12 +31,14 @@
  *   geen-template  deze repo is niet uit de template gebouwd
  *   klaar          (na --droogloop) de werkkopie staat klaar; zie bijgewerkt, overgeslagen
  *   gepusht        (na --werkmap) de branch staat op GitHub; zie pr of vergelijkUrl
- *   gestopt        er is een reden om niet door te gaan (bijvoorbeeld een open PR van de
- *                  beheerde run, of een branch waar iemand zelf op heeft gecommit)
+ *   gestopt        er is een reden om niet door te gaan (bijvoorbeeld een branch waar
+ *                  iemand zelf op heeft gecommit)
  *   mislukt        een voorwaarde ontbreekt; `reden` is één zin met één handeling
  * De reden bevat nooit een token: een URL met login wordt afgeplakt.
  */
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { controleer as controleerAbTests, openNaAntwoord, STACK_CONFIG as AB_CONFIG } from "../../../lib/abtests.mjs";
+import { zetVerplichteControle } from "../../../lib/controles.mjs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -59,18 +65,20 @@ import {
   openPRVoorVersie,
   originPushUrl,
   originUrl,
+  nodeVoorKern,
   pnpmVoorKern,
   push,
   pushDroog,
   repoUitUrl,
+  sh,
   sluitOuderePRs,
   templateRepo,
   vergelijkUrl,
   versieOpAfstand,
 } from "../../../lib/repo.mjs";
+import { controleerOpenTabellen, controleerSmal, controleerTestrol, zetKoppen } from "../../../lib/projectbestanden.mjs";
 import { LOCKFILE, MANIFEST_PAD, leesVersie, pasToe } from "../../../lib/toepassen.mjs";
 
-export const AFZENDER = "klantsessie";
 export const WERKMAP_PREFIX = "stack-bijwerken-";
 const WERKMAP_MAX_LEEFTIJD_MS = 60 * 60 * 1000;
 const TOESTAND = "toestand.json";
@@ -78,7 +86,7 @@ const TOESTAND = "toestand.json";
 // ---------------------------------------------------------------- argumenten
 
 export function leesArgumenten(argv) {
-  const uit = { json: false, droogloop: false, werkmap: null, losOp: [], checkout: null, repo: null };
+  const uit = { json: false, droogloop: false, werkmap: null, losOp: [], koppen: {}, checkout: null, repo: null };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === "--json") uit.json = true;
@@ -88,6 +96,9 @@ export function leesArgumenten(argv) {
     else if (a === "--repo") uit.repo = argv[++i] ?? null;
     else if (a === "--los-op") {
       uit.losOp.push({ pad: argv[++i] ?? null, keuze: argv[++i] ?? null });
+    } else if (a === "--kop") {
+      const pad = argv[++i] ?? "";
+      uit.koppen[pad] = argv[++i] ?? "";
     } else throw new Error(`onbekend argument: ${a}`);
   }
   return uit;
@@ -174,16 +185,26 @@ function isTemplateApp(map) {
   return existsSync(join(map, MANIFEST_PAD)) && leesVersie(map) !== null;
 }
 
-const ANDER_SPOOR = {
-  status: "ander-spoor",
-  reden: "deze app komt uit een oudere template van Stage Two die deze plugin niet bijwerkt; vraag Stage Two hoe deze app bij te werken",
-};
+/**
+ * Een app van een ander spoor: zeg welke plugin hem wel bijwerkt. Geen `variant` is het
+ * Vercel-spoor, `"light"` de template voor tier 1 (één Worker met D1 en R2).
+ */
+export function anderSpoor(manifest) {
+  const variant = manifest && typeof manifest === "object" ? manifest.variant : undefined;
+  const reden =
+    variant === "light"
+      ? "deze app komt uit de template voor tier 1 van Stage Two (één Cloudflare Worker met D1 en R2); die werk je bij met /stagetwo-tier1:updaten van de andere Stage Two-plugin, niet met deze"
+      : variant === undefined || variant === null
+        ? "deze app komt uit een oudere template van Stage Two die deze plugin niet bijwerkt; hij blijft werken zoals hij is. Overstappen naar tier 2 is herbouwen: zet het met Claude op een rij in /stagetwo-tier2:verder-werken (wie dat liever uitbesteedt, kan het als betaald werk door Stage Two laten doen)"
+        : `deze app heeft variant ${JSON.stringify(variant)} in .claude/stack-manifest.json en is niet van tier 2; deze plugin werkt alleen apps uit de template voor tier 2 bij`;
+  return { status: "ander-spoor", reden };
+}
 
-function isCloudflareApp(map) {
+function leesManifestRuw(map) {
   try {
-    return isCloudflareManifest(JSON.parse(readFileSync(join(map, MANIFEST_PAD), "utf8")));
+    return JSON.parse(readFileSync(join(map, MANIFEST_PAD), "utf8"));
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -201,7 +222,7 @@ export function droogloop({ checkout, opAfstand = null, env = process.env }) {
     return mislukt("geef --repo als eigenaar/naam, bijvoorbeeld Mijn-Bedrijf/voorraad");
   }
   if (opAfstand === null && !isTemplateApp(checkout)) return GEEN_TEMPLATE;
-  if (opAfstand === null && !isCloudflareApp(checkout)) return ANDER_SPOOR;
+  if (opAfstand === null && !isCloudflareManifest(leesManifestRuw(checkout))) return anderSpoor(leesManifestRuw(checkout));
 
   const metGh = ghAanwezig();
   if (opAfstand !== null && !metGh) return mislukt("een andere app bijwerken kan alleen met de GitHub-opdrachtregel (gh); draai eerst /stagetwo-tier2:installatie");
@@ -213,10 +234,10 @@ export function droogloop({ checkout, opAfstand = null, env = process.env }) {
 
   const tmplRepo = templateRepo(env);
   const doel = versieOpAfstand(tmplRepo);
-  if (doel === null) return mislukt(`de template is niet bereikbaar (${tmplRepo}): geen netwerk, nog geen versie-tag, of de repo bestaat niet of is niet openbaar; probeer het later opnieuw, en geef deze melding door aan Stage Two als het dan nog niet lukt`);
+  if (doel === null) return mislukt(`de template is niet bereikbaar (${tmplRepo}): geen netwerk, nog geen versie-tag, of de repo bestaat niet of is niet openbaar; probeer het later opnieuw; lukt het dan nog niet, draai /stagetwo-tier2:installatie (die zet de plugin naar de kopie in de eigen organisatie)`);
   if (opAfstand === null && leesVersie(checkout) >= doel) return alBij(leesVersie(checkout), doel);
 
-  const branch = branchNaam(AFZENDER, doel);
+  const branch = branchNaam(doel);
   if (metGh && repo) {
     let andere = null;
     try {
@@ -225,7 +246,7 @@ export function droogloop({ checkout, opAfstand = null, env = process.env }) {
       return mislukt(`de open pull requests van ${repo} zijn niet op te vragen: ${eersteRegel(fout)}`);
     }
     if (andere && andere.headRefName !== branch) {
-      return gestopt(`er staat al een pull request open voor versie ${doel}, geopend door Stage Two: ${andere.url}; merge die, of vraag Stage Two hem te sluiten`, { pr: andere });
+      return gestopt(`er staat al een pull request open voor versie ${doel}, geopend door Stage Two: ${andere.url}; merge die, of sluit hem zelf op GitHub (Close pull request) en draai dit opnieuw`, { pr: andere });
     }
   }
 
@@ -236,6 +257,13 @@ export function droogloop({ checkout, opAfstand = null, env = process.env }) {
       if (!isTemplateApp(kloon)) {
         verwijderWerkmap(werkmap);
         return GEEN_TEMPLATE;
+      }
+      // Ook een andere app moet van dit spoor zijn: nooit bestanden van tier 2 in een app van
+      // tier 1 of van het Vercel-spoor (gevonden bij de test van uitgave 40 op een app van tier 1).
+      if (!isCloudflareManifest(leesManifestRuw(kloon))) {
+        const uit = anderSpoor(leesManifestRuw(kloon));
+        verwijderWerkmap(werkmap);
+        return uit;
       }
       if (leesVersie(kloon) >= doel) {
         verwijderWerkmap(werkmap);
@@ -263,7 +291,7 @@ export function droogloop({ checkout, opAfstand = null, env = process.env }) {
     checkoutTag(tmplMap, doel);
     maakBranch(kloon, branch);
 
-    const resultaat = pasToe({ map: kloon, tmplMap, git: gitVoorKern(kloon, tmplMap), pnpm: pnpmVoorKern() });
+    const resultaat = pasToe({ map: kloon, tmplMap, git: gitVoorKern(kloon, tmplMap), pnpm: pnpmVoorKern(), node: nodeVoorKern() });
     if (resultaat.status !== "bijgewerkt") {
       verwijderWerkmap(werkmap);
       return { ...resultaat, reden: resultaat.reden && zonderLogin(resultaat.reden) };
@@ -283,12 +311,25 @@ function uitlegNaDroogloop(resultaat) {
   const n = resultaat.bijgewerkt.length;
   const w = resultaat.verwijderd.length;
   const o = resultaat.overgeslagen.length;
+  const eigen = resultaat.projectbestanden ?? [];
   return {
     samenvatting: [
       `Van versie ${resultaat.van} naar ${resultaat.naar}: ${n} bestand(en) bijgewerkt, ${w} verwijderd, ${o} overgeslagen.`,
       o > 0
         ? "Bij de overgeslagen bestanden is lokaal iets aangepast; kies per bestand: de template overnemen of de eigen versie houden."
-        : "Alleen bestanden van de template zijn geraakt; je eigen code niet.",
+        : eigen.length > 0
+          ? "Verder alleen bestanden van de template."
+          : "Alleen bestanden van de template zijn geraakt; je eigen code niet.",
+      ...(eigen.length > 0
+        ? [`Eenmalig voor deze versie ook in je eigen bestanden: ${eigen.join(", ")}.`]
+        : []),
+      ...(resultaat.abTests
+        ? [`${resultaat.abTests.tabellen.length} tabel(len) zonder A/B-test (${resultaat.abTests.tabellen.join(", ")}); de tests komen in deze pull request.`]
+        : []),
+      ...((resultaat.openTabellen?.tabellen ?? []).length > 0
+        ? [`Open tabellen zonder echte reden: ${resultaat.openTabellen.tabellen.join(", ")}; de redenen komen in deze pull request.`]
+        : []),
+      ...(resultaat.testrol ? [`${resultaat.testrol.pad} krijgt de testrol in deze pull request.`] : []),
       "Er is nog niets gepusht.",
     ],
   };
@@ -296,7 +337,7 @@ function uitlegNaDroogloop(resultaat) {
 
 // ---------------------------------------------------------------- de tweede aanroep
 
-export function voerUit({ werkmap, losOp, updates = null }) {
+export function voerUit({ werkmap, losOp, koppen = {}, updates = null }) {
   const controle = controleerWerkmap(werkmap);
   if (controle.fout) {
     // Een verouderde map van onszelf ruimen we op; een vreemde map laten we staan.
@@ -331,10 +372,35 @@ export function voerUit({ werkmap, losOp, updates = null }) {
       }
       opgelost.push({ pad, keuze });
     }
+    const kopFout = zetKoppen(kloon, resultaat.onderdelen ?? null, koppen);
+    if (kopFout) {
+      verwijderWerkmap(werkmap);
+      return mislukt(kopFout);
+    }
     const nogOvergeslagen = resultaat.overgeslagen.filter((s) => !opgelost.some((o) => o.pad === s.pad)).map(({ verschil: _, ...rest }) => rest);
 
+    // De A/B-tests die Claude tussen de twee aanroepen schreef: alleen de paden uit de droogloop.
+    // Zei de bouwer dat iedereen in de app een tabel mag zien, dan staat zijn antwoord nu als
+    // reden in open_tabellen; alleen zo'n nieuwe regel mag erbij.
+    const antwoord = openNaAntwoord({ map: kloon, abTests: resultaat.abTests ?? null, magReden: resultaat.openTabellen?.tabellen ?? [] });
+    if (antwoord.fout) {
+      verwijderWerkmap(werkmap);
+      return gestopt(antwoord.fout);
+    }
+    const ab = controleerAbTests({ map: kloon, node: nodeVoorKern(), abTests: resultaat.abTests ?? null, open: antwoord.open });
+    // De redenen in open_tabellen en de testrol in global-setup, ook van Claude: zo zitten ze in
+    // de commit van updaten zelf, en stopt een volgende updaten niet op een vreemde commit.
+    const open = controleerOpenTabellen(kloon, resultaat.openTabellen ?? null, antwoord.open.map((o) => o.tabel));
+    if (open.fout) {
+      verwijderWerkmap(werkmap);
+      return gestopt(open.fout);
+    }
+    const testrol = controleerTestrol(kloon, resultaat.testrol ?? null);
+    const smal = controleerSmal(kloon, resultaat.openTabellen ?? null);
+    formatteer({ kloon, checkout, paden: [...ab.paden.filter((p) => p !== AB_CONFIG), ...(testrol?.gedaan ? [testrol.pad] : [])] });
+
     // De controle op zichzelf, nog een keer: ook na de keuzes mag alleen het manifest geraakt zijn.
-    const magOok = new Set([...toegestaneBestandenVan(manifest), ...resultaat.verwijderd, LOCKFILE]);
+    const magOok = new Set([...toegestaneBestandenVan(manifest), ...resultaat.verwijderd, ...(resultaat.projectbestanden ?? []), ...ab.paden, ...(testrol ? [testrol.pad] : []), ...(smal?.gedaan ? [smal.pad] : []), LOCKFILE]);
     const buiten = gewijzigdePaden(kloon).filter((pad) => !magOok.has(pad));
     if (buiten.length > 0) {
       verwijderWerkmap(werkmap);
@@ -347,7 +413,17 @@ export function voerUit({ werkmap, losOp, updates = null }) {
       verwijderWerkmap(werkmap);
       return mislukt("git kent je naam en e-mailadres niet; stel ze in met `git config --global user.name` en `user.email`");
     }
-    const eind = { ...resultaat, overgeslagen: nogOvergeslagen, opgelost };
+    const eind = {
+      ...resultaat,
+      overgeslagen: nogOvergeslagen,
+      opgelost,
+      abTests: ab,
+      openTabellen: open,
+      testrol,
+      smal,
+      projectbestanden: [...(resultaat.projectbestanden ?? []), ...(testrol?.gedaan ? [testrol.pad] : []), ...(smal?.gedaan ? [smal.pad] : [])],
+      voorDeBouwer: [...(resultaat.voorDeBouwer ?? [])],
+    };
     commit({ map: kloon, identiteit, bericht: `chore: template naar versie ${resultaat.naar}`, versie: resultaat.naar });
 
     // Tussen de droogloop en nu kan iemand op de branch hebben gecommit; ook dan blijven we ervan af.
@@ -358,8 +434,13 @@ export function voerUit({ werkmap, losOp, updates = null }) {
     const gepusht = !alGelijkOpGitHub(kloon, branch);
     if (gepusht) push(kloon, branch);
 
+    // De verplichte controle "Droogloop migraties" op main, met de rechten van de bouwer. De
+    // update-PR zelf krijgt die status van Droogloop aanvragen, ook zolang main hem nog niet heeft.
+    const ruleset = metGh && repo ? zetVerplichteControle(repo, { gh: (args) => sh("gh", args) }) : null;
+    if (ruleset?.regel) eind.voorDeBouwer.push(ruleset.regel);
+
     const uitgaven = uitgavenTussen(updates, { van: resultaat.van, tot: resultaat.naar });
-    const tekst = prTekst({ resultaat: eind, afzender: AFZENDER, uitgaven });
+    const tekst = prTekst({ resultaat: eind, uitgaven });
     let pr = null;
     if (metGh && repo) {
       pr = openOfWerkPRBij({ repo, branch, titel: prTitel(resultaat.naar), tekst });
@@ -378,6 +459,13 @@ export function voerUit({ werkmap, losOp, updates = null }) {
       verwijderd: eind.verwijderd,
       overgeslagen: eind.overgeslagen,
       opgelost,
+      projectbestanden: eind.projectbestanden ?? [],
+      voorDeBouwer: eind.voorDeBouwer ?? [],
+      abTests: ab,
+      openTabellen: open,
+      testrol,
+      smal,
+      ruleset,
       samenvatting: uitlegNaPush({ gepusht, pr, repo, branch, resultaat: eind }),
     };
   } catch (fout) {
@@ -392,11 +480,55 @@ function uitlegNaPush({ gepusht, pr, repo, branch, resultaat }) {
   else if (repo) regels.push(`De branch ${branch} staat op GitHub; open de pull request hier: ${vergelijkUrl(repo, branch)}`);
   else regels.push(`De branch ${branch} staat op je origin.`);
   if (!gepusht) regels.push("De inhoud stond al zo op GitHub; er is niets opnieuw gepusht.");
-  regels.push("Wacht tot de checks groen zijn en druk dan op Merge. Rood? Neem contact op met Stage Two, zet de check niet uit.");
+  regels.push("Wacht tot de checks groen zijn en druk dan op Merge. Rood? Zet de check niet uit: los het op met /stagetwo-tier2:verder-werken (een eigen pull request) en draai daarna /stagetwo-tier2:updaten opnieuw.");
   if (resultaat.overgeslagen.length > 0) {
     regels.push(`${resultaat.overgeslagen.length} bestand(en) zijn niet bijgewerkt omdat ze lokaal afwijken; dat staat in de pull request.`);
   }
+  if ((resultaat.voorDeBouwer ?? []).length > 0) {
+    regels.push("Voor deze versie is er ook iets voor jou om na te lopen; dat staat in de pull request onder Voor jou.");
+  }
+  if ((resultaat.abTests?.geschreven ?? []).length > 0) {
+    regels.push(`Voor ${resultaat.abTests.geschreven.length} tabel(len) staat er nu een A/B-test in de pull request; daar hoef je niets voor te doen.`);
+  }
   return regels;
+}
+
+/**
+ * De A/B-tests in de opmaak van de app zetten (biome, zoals pnpm lint), met de biome uit de
+ * open checkout als die er is. Zonder checkout (--repo) of zonder biome gebeurt er niets; dan
+ * moet Claude de opmaak zelf goed hebben (de skill zegt hoe). Een fout stopt niets.
+ */
+/**
+ * Zet de opmaak van de bestanden die Claude schreef recht met Biome. Staat de app op deze
+ * computer, dan de Biome uit zijn node_modules. Werkt updaten een andere app bij (`--repo`), dan
+ * is die er niet: dan Biome in de versie uit de package.json van de app, via `pnpm dlx`. Zonder
+ * die stap werd de update-PR rood op "Opmaak en lint" (gevonden bij de test van uitgave 40).
+ */
+export function formatteer({ kloon, checkout, paden }) {
+  if (paden.length === 0) return;
+  const biome = checkout ? join(checkout, "node_modules", "@biomejs", "biome", "bin", "biome") : null;
+  try {
+    if (biome && existsSync(biome)) {
+      sh(process.execPath, [biome, "check", "--write", ...paden], { cwd: kloon });
+      return;
+    }
+    const versie = biomeVersie(kloon);
+    if (versie) sh("pnpm", ["dlx", `@biomejs/biome@${versie}`, "check", "--write", ...paden], { cwd: kloon, timeout: 180000 });
+  } catch {
+    // Een opmaakfout ziet de kwaliteitspoort; het bijwerken gaat door.
+  }
+}
+
+/** De versie van Biome uit de package.json van de app, zonder ^ of ~; null als die er niet is. */
+export function biomeVersie(map) {
+  try {
+    const pkg = JSON.parse(readFileSync(join(map, "package.json"), "utf8"));
+    const ruw = pkg.devDependencies?.["@biomejs/biome"] ?? pkg.dependencies?.["@biomejs/biome"];
+    const versie = typeof ruw === "string" ? ruw.replace(/^[\^~]/, "") : "";
+    return /^\d+\.\d+\.\d+(-[\w.]+)?$/.test(versie) ? versie : null;
+  } catch {
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------- draaien
@@ -409,7 +541,7 @@ export function hoofd(argv, { cwd = process.cwd(), env = process.env, updates = 
     return { status: "mislukt", reden: fout.message };
   }
   const checkout = resolve(args.checkout ?? cwd);
-  if (args.werkmap) return voerUit({ werkmap: args.werkmap, losOp: args.losOp, updates });
+  if (args.werkmap) return voerUit({ werkmap: args.werkmap, losOp: args.losOp, koppen: args.koppen, updates });
   if (args.droogloop) return droogloop({ checkout, opAfstand: args.repo, env });
   return mislukt("geef --droogloop (eerste aanroep) of --werkmap <map> (tweede aanroep) mee");
 }
